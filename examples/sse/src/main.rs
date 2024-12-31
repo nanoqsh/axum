@@ -9,7 +9,7 @@
 //! ```
 
 use axum::{
-    response::sse::{Event, Sse},
+    response::{sse::Event, Sse},
     routing::get,
     Router,
 };

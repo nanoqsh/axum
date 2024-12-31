@@ -4,7 +4,6 @@ use http::{header, HeaderValue, StatusCode};
 
 mod redirect;
 
-#[cfg(feature = "tokio")]
 pub mod sse;
 
 #[doc(no_inline)]
@@ -28,7 +27,7 @@ pub use self::redirect::Redirect;
 
 #[doc(inline)]
 #[cfg(feature = "tokio")]
-pub use sse::Sse;
+pub use sse::tokio_keep_alive::Sse;
 
 /// An HTML response.
 ///

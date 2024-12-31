@@ -4,9 +4,12 @@
 //!
 //! ```
 //! use axum::{
-//!     Router,
+//!     response::{
+//!         sse::{Event, KeepAlive},
+//!         Sse,
+//!     },
 //!     routing::get,
-//!     response::sse::{Event, KeepAlive, Sse},
+//!     Router,
 //! };
 //! use std::{time::Duration, convert::Infallible};
 //! use tokio_stream::StreamExt as _ ;
@@ -34,31 +37,28 @@ use axum_core::{
     response::{IntoResponse, Response},
 };
 use bytes::{BufMut, BytesMut};
-use futures_util::{
-    ready,
-    stream::{Stream, TryStream},
-};
+use futures_util::stream::{Stream, TryStream};
 use http_body::Frame;
 use pin_project_lite::pin_project;
 use std::{
     fmt,
-    future::Future,
     pin::Pin,
     task::{Context, Poll},
     time::Duration,
 };
 use sync_wrapper::SyncWrapper;
-use tokio::time::Sleep;
 
-/// An SSE response
-#[derive(Clone)]
+/// A runtime independent SSE response
 #[must_use]
-pub struct Sse<S> {
+pub struct Sse<S, K = NoKeepAlive>
+where
+    K: KeepAliveStream,
+{
     stream: S,
-    keep_alive: Option<KeepAlive>,
+    keep_alive: K::KeepAlive,
 }
 
-impl<S> Sse<S> {
+impl<S> Sse<S, NoKeepAlive> {
     /// Create a new [`Sse`] response that will respond with the given stream of
     /// [`Event`]s.
     ///
@@ -70,20 +70,54 @@ impl<S> Sse<S> {
     {
         Sse {
             stream,
-            keep_alive: None,
+            keep_alive: (),
         }
     }
 
-    /// Configure the interval between keep-alive messages.
+    /// Configure a [custom](KeepAliveStream) interval between keep-alive messages.
+    pub fn custom_keep_alive<K>(self, keep_alive: K::KeepAlive) -> Sse<S, K>
+    where
+        K: KeepAliveStream,
+    {
+        Sse {
+            stream: self.stream,
+            keep_alive,
+        }
+    }
+
+    /// Configure the interval between keep-alive messages for tokio runtime.
     ///
-    /// Defaults to no keep-alive messages.
-    pub fn keep_alive(mut self, keep_alive: KeepAlive) -> Self {
-        self.keep_alive = Some(keep_alive);
-        self
+    /// This is the standard keep-alive implementation. For customized behavior,
+    /// provide your own [implementation](KeepAliveStream) to the
+    /// [`custom_keep_alive`](Sse::custom_keep_alive) method.
+    #[cfg(feature = "tokio")]
+    pub fn keep_alive(
+        self,
+        keep_alive: KeepAlive,
+    ) -> Sse<S, tokio_keep_alive::TokioKeepAliveStream> {
+        self.custom_keep_alive(keep_alive)
     }
 }
 
-impl<S> fmt::Debug for Sse<S> {
+impl<S, K> Clone for Sse<S, K>
+where
+    S: Clone,
+    K: KeepAliveStream,
+    K::KeepAlive: Clone,
+{
+    fn clone(&self) -> Self {
+        Self {
+            stream: self.stream.clone(),
+            keep_alive: self.keep_alive.clone(),
+        }
+    }
+}
+
+impl<S, K> fmt::Debug for Sse<S, K>
+where
+    K: KeepAliveStream,
+    K::KeepAlive: fmt::Debug,
+{
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Sse")
             .field("stream", &format_args!("{}", std::any::type_name::<S>()))
@@ -92,9 +126,10 @@ impl<S> fmt::Debug for Sse<S> {
     }
 }
 
-impl<S, E> IntoResponse for Sse<S>
+impl<S, K, E> IntoResponse for Sse<S, K>
 where
     S: Stream<Item = Result<Event, E>> + Send + 'static,
+    K: KeepAliveStream + Send + 'static,
     E: Into<BoxError>,
 {
     fn into_response(self) -> Response {
@@ -105,7 +140,7 @@ where
             ],
             Body::new(SseBody {
                 event_stream: SyncWrapper::new(self.stream),
-                keep_alive: self.keep_alive.map(KeepAliveStream::new),
+                keep_alive: K::new(self.keep_alive),
             }),
         )
             .into_response()
@@ -113,17 +148,18 @@ where
 }
 
 pin_project! {
-    struct SseBody<S> {
+    struct SseBody<S, K> {
         #[pin]
         event_stream: SyncWrapper<S>,
         #[pin]
-        keep_alive: Option<KeepAliveStream>,
+        keep_alive: K,
     }
 }
 
-impl<S, E> HttpBody for SseBody<S>
+impl<S, K, E> HttpBody for SseBody<S, K>
 where
     S: Stream<Item = Result<Event, E>>,
+    K: KeepAliveStream,
 {
     type Data = Bytes;
     type Error = E;
@@ -135,17 +171,12 @@ where
         let this = self.project();
 
         match this.event_stream.get_pin_mut().poll_next(cx) {
-            Poll::Pending => {
-                if let Some(keep_alive) = this.keep_alive.as_pin_mut() {
-                    keep_alive.poll_event(cx).map(|e| Some(Ok(Frame::data(e))))
-                } else {
-                    Poll::Pending
-                }
-            }
+            Poll::Pending => this
+                .keep_alive
+                .poll_event(cx)
+                .map(|e| Some(Ok(Frame::data(e)))),
             Poll::Ready(Some(Ok(event))) => {
-                if let Some(keep_alive) = this.keep_alive.as_pin_mut() {
-                    keep_alive.reset();
-                }
+                this.keep_alive.reset();
                 Poll::Ready(Some(Ok(Frame::data(event.finalize()))))
             }
             Poll::Ready(Some(Err(error))) => Poll::Ready(Some(Err(error))),
@@ -465,39 +496,92 @@ impl Default for KeepAlive {
     }
 }
 
-pin_project! {
-    #[derive(Debug)]
-    struct KeepAliveStream {
-        keep_alive: KeepAlive,
-        #[pin]
-        alive_timer: Sleep,
+/// Trait for [`Sse`] keep-alive stream
+pub trait KeepAliveStream {
+    /// The stream confiuration type
+    type KeepAlive;
+
+    /// Creates new stream from confiuration
+    fn new(keep_alive: Self::KeepAlive) -> Self;
+
+    /// Resets the internal timer of the stream
+    fn reset(self: Pin<&mut Self>);
+
+    /// Polls the keep-alive stream for the next event
+    fn poll_event(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Bytes>;
+}
+
+/// No-op keep alive implementation
+#[derive(Clone, Debug)]
+pub struct NoKeepAlive;
+
+impl KeepAliveStream for NoKeepAlive {
+    type KeepAlive = ();
+
+    fn new(_: Self::KeepAlive) -> Self {
+        Self
+    }
+
+    fn reset(self: Pin<&mut Self>) {}
+
+    fn poll_event(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Bytes> {
+        Poll::Pending
     }
 }
 
-impl KeepAliveStream {
-    fn new(keep_alive: KeepAlive) -> Self {
-        Self {
-            alive_timer: tokio::time::sleep(keep_alive.max_interval),
-            keep_alive,
+/// Tokio specific keep alive implementation
+#[cfg(feature = "tokio")]
+pub mod tokio_keep_alive {
+    use super::{Bytes, KeepAlive, KeepAliveStream};
+    use futures_util::ready;
+    use pin_project_lite::pin_project;
+    use std::{
+        future::Future,
+        pin::Pin,
+        task::{Context, Poll},
+    };
+    use tokio::time::Sleep;
+
+    /// An SSE response with tokio keep alive stream
+    pub type Sse<S, K = TokioKeepAliveStream> = super::Sse<S, K>;
+
+    pin_project! {
+        /// Keep alive [stream](KeepAliveStream) for tokio runtime
+        #[derive(Debug)]
+        pub struct TokioKeepAliveStream {
+            keep_alive: KeepAlive,
+            #[pin]
+            alive_timer: Sleep,
         }
     }
 
-    fn reset(self: Pin<&mut Self>) {
-        let this = self.project();
-        this.alive_timer
-            .reset(tokio::time::Instant::now() + this.keep_alive.max_interval);
-    }
+    impl KeepAliveStream for TokioKeepAliveStream {
+        type KeepAlive = KeepAlive;
 
-    fn poll_event(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Bytes> {
-        let this = self.as_mut().project();
+        fn new(keep_alive: Self::KeepAlive) -> Self {
+            Self {
+                alive_timer: tokio::time::sleep(keep_alive.max_interval),
+                keep_alive,
+            }
+        }
 
-        ready!(this.alive_timer.poll(cx));
+        fn reset(self: Pin<&mut Self>) {
+            let this = self.project();
+            this.alive_timer
+                .reset(tokio::time::Instant::now() + this.keep_alive.max_interval);
+        }
 
-        let event = this.keep_alive.event.clone();
+        fn poll_event(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Bytes> {
+            let this = self.as_mut().project();
 
-        self.reset();
+            ready!(this.alive_timer.poll(cx));
 
-        Poll::Ready(event)
+            let event = this.keep_alive.event.clone();
+
+            self.reset();
+
+            Poll::Ready(event)
+        }
     }
 }
 
