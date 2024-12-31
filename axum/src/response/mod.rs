@@ -27,7 +27,7 @@ pub use self::redirect::Redirect;
 
 #[doc(inline)]
 #[cfg(feature = "tokio")]
-pub use sse::tokio_keep_alive::Sse;
+pub use sse::tokio_sse::Sse;
 
 /// An HTML response.
 ///

@@ -37,28 +37,29 @@ use axum_core::{
     response::{IntoResponse, Response},
 };
 use bytes::{BufMut, BytesMut};
+use futures_util::ready;
 use futures_util::stream::{Stream, TryStream};
 use http_body::Frame;
 use pin_project_lite::pin_project;
 use std::{
     fmt,
+    marker::PhantomData,
     pin::Pin,
     task::{Context, Poll},
     time::Duration,
+    time::Instant,
 };
 use sync_wrapper::SyncWrapper;
 
 /// A runtime independent SSE response
 #[must_use]
-pub struct Sse<S, K = NoKeepAlive>
-where
-    K: KeepAliveStream,
-{
+pub struct Sse<S, T = NoTimer> {
     stream: S,
-    keep_alive: K::KeepAlive,
+    keep_alive: KeepAlive,
+    timer: PhantomData<T>,
 }
 
-impl<S> Sse<S, NoKeepAlive> {
+impl<S> Sse<S, NoTimer> {
     /// Create a new [`Sse`] response that will respond with the given stream of
     /// [`Event`]s.
     ///
@@ -70,66 +71,62 @@ impl<S> Sse<S, NoKeepAlive> {
     {
         Sse {
             stream,
-            keep_alive: (),
+            keep_alive: KeepAlive::new(),
+            timer: PhantomData,
         }
     }
 
-    /// Configure a [custom](KeepAliveStream) interval between keep-alive messages.
-    pub fn custom_keep_alive<K>(self, keep_alive: K::KeepAlive) -> Sse<S, K>
+    /// Configure the interval between keep-alive messages for a specific
+    /// [`Timer`].
+    pub fn keep_alive_with_timer<T>(self, keep_alive: KeepAlive) -> Sse<S, T>
     where
-        K: KeepAliveStream,
+        T: Timer,
     {
         Sse {
             stream: self.stream,
             keep_alive,
+            timer: PhantomData,
         }
     }
 
     /// Configure the interval between keep-alive messages for tokio runtime.
     ///
-    /// This is the standard keep-alive implementation. For customized behavior,
-    /// provide your own [implementation](KeepAliveStream) to the
-    /// [`custom_keep_alive`](Sse::custom_keep_alive) method.
+    /// This method uses the default [`Timer`] implementation. Use
+    /// [`keep_alive_with_timer`](Sse::keep_alive_with_timer) to specify
+    /// a custom implementation.
     #[cfg(feature = "tokio")]
-    pub fn keep_alive(
-        self,
-        keep_alive: KeepAlive,
-    ) -> Sse<S, tokio_keep_alive::TokioKeepAliveStream> {
-        self.custom_keep_alive(keep_alive)
+    pub fn keep_alive(self, keep_alive: KeepAlive) -> Sse<S, tokio::time::Sleep> {
+        self.keep_alive_with_timer(keep_alive)
     }
 }
 
-impl<S, K> Clone for Sse<S, K>
+impl<S, T> Clone for Sse<S, T>
 where
     S: Clone,
-    K: KeepAliveStream,
-    K::KeepAlive: Clone,
 {
     fn clone(&self) -> Self {
         Self {
             stream: self.stream.clone(),
             keep_alive: self.keep_alive.clone(),
+            timer: PhantomData,
         }
     }
 }
 
-impl<S, K> fmt::Debug for Sse<S, K>
-where
-    K: KeepAliveStream,
-    K::KeepAlive: fmt::Debug,
-{
+impl<S, T> fmt::Debug for Sse<S, T> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Sse")
             .field("stream", &format_args!("{}", std::any::type_name::<S>()))
             .field("keep_alive", &self.keep_alive)
+            .field("timer", &format_args!("{}", std::any::type_name::<T>()))
             .finish()
     }
 }
 
-impl<S, K, E> IntoResponse for Sse<S, K>
+impl<S, T, E> IntoResponse for Sse<S, T>
 where
     S: Stream<Item = Result<Event, E>> + Send + 'static,
-    K: KeepAliveStream + Send + 'static,
+    T: Timer + Send + 'static,
     E: Into<BoxError>,
 {
     fn into_response(self) -> Response {
@@ -140,7 +137,7 @@ where
             ],
             Body::new(SseBody {
                 event_stream: SyncWrapper::new(self.stream),
-                keep_alive: K::new(self.keep_alive),
+                keep_alive: KeepAliveStream::<T>::new(self.keep_alive),
             }),
         )
             .into_response()
@@ -148,18 +145,18 @@ where
 }
 
 pin_project! {
-    struct SseBody<S, K> {
+    struct SseBody<S, T> {
         #[pin]
         event_stream: SyncWrapper<S>,
         #[pin]
-        keep_alive: K,
+        keep_alive: KeepAliveStream<T>,
     }
 }
 
-impl<S, K, E> HttpBody for SseBody<S, K>
+impl<S, T, E> HttpBody for SseBody<S, T>
 where
     S: Stream<Item = Result<Event, E>>,
-    K: KeepAliveStream,
+    T: Timer,
 {
     type Data = Bytes;
     type Error = E;
@@ -496,91 +493,99 @@ impl Default for KeepAlive {
     }
 }
 
-/// Trait for [`Sse`] keep-alive stream
-pub trait KeepAliveStream {
-    /// The stream confiuration type
-    type KeepAlive;
-
-    /// Creates new stream from confiuration
-    fn new(keep_alive: Self::KeepAlive) -> Self;
-
-    /// Resets the internal timer of the stream
-    fn reset(self: Pin<&mut Self>);
-
-    /// Polls the keep-alive stream for the next event
-    fn poll_event(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Bytes>;
+pin_project! {
+    #[derive(Debug)]
+    struct KeepAliveStream<T> {
+        #[pin]
+        alive_timer: T,
+        keep_alive: KeepAlive,
+    }
 }
 
-/// No-op keep alive implementation
-#[derive(Clone, Debug)]
-pub struct NoKeepAlive;
+impl<T> KeepAliveStream<T>
+where
+    T: Timer,
+{
+    fn new(keep_alive: KeepAlive) -> Self {
+        Self {
+            alive_timer: T::after(keep_alive.max_interval),
+            keep_alive,
+        }
+    }
 
-impl KeepAliveStream for NoKeepAlive {
-    type KeepAlive = ();
+    fn reset(self: Pin<&mut Self>) {
+        let this = self.project();
+        this.alive_timer
+            .reset(tokio::time::Instant::now().into_std() + this.keep_alive.max_interval);
+    }
 
-    fn new(_: Self::KeepAlive) -> Self {
+    fn poll_event(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Bytes> {
+        let this = self.as_mut().project();
+
+        ready!(this.alive_timer.poll_timeout(cx));
+
+        let event = this.keep_alive.event.clone();
+
+        self.reset();
+
+        Poll::Ready(event)
+    }
+}
+
+/// A timer trait for keep-alive stream
+pub trait Timer {
+    /// Creates a new timer with specified timeout.
+    fn after(duration: Duration) -> Self;
+
+    /// Resets the timer to a new deadline.
+    fn reset(self: Pin<&mut Self>, deadline: Instant);
+
+    /// Polls the timer to complete after specified timeout.
+    fn poll_timeout(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()>;
+}
+
+/// No-op [`Timer`] implementation
+#[derive(Debug)]
+pub struct NoTimer;
+
+impl Timer for NoTimer {
+    fn after(_: Duration) -> Self {
         Self
     }
 
-    fn reset(self: Pin<&mut Self>) {}
+    fn reset(self: Pin<&mut Self>, _: Instant) {}
 
-    fn poll_event(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Bytes> {
+    fn poll_timeout(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<()> {
         Poll::Pending
     }
 }
 
-/// Tokio specific keep alive implementation
+/// Tokio specific SSE implementation
 #[cfg(feature = "tokio")]
-pub mod tokio_keep_alive {
-    use super::{Bytes, KeepAlive, KeepAliveStream};
-    use futures_util::ready;
-    use pin_project_lite::pin_project;
+pub mod tokio_sse {
+    use super::Timer;
     use std::{
         future::Future,
         pin::Pin,
         task::{Context, Poll},
+        time::{Duration, Instant},
     };
     use tokio::time::Sleep;
 
-    /// An SSE response with tokio keep alive stream
-    pub type Sse<S, K = TokioKeepAliveStream> = super::Sse<S, K>;
+    /// An SSE response with tokio timer
+    pub type Sse<S, T = Sleep> = super::Sse<S, T>;
 
-    pin_project! {
-        /// Keep alive [stream](KeepAliveStream) for tokio runtime
-        #[derive(Debug)]
-        pub struct TokioKeepAliveStream {
-            keep_alive: KeepAlive,
-            #[pin]
-            alive_timer: Sleep,
-        }
-    }
-
-    impl KeepAliveStream for TokioKeepAliveStream {
-        type KeepAlive = KeepAlive;
-
-        fn new(keep_alive: Self::KeepAlive) -> Self {
-            Self {
-                alive_timer: tokio::time::sleep(keep_alive.max_interval),
-                keep_alive,
-            }
+    impl Timer for Sleep {
+        fn after(duration: Duration) -> Self {
+            tokio::time::sleep(duration)
         }
 
-        fn reset(self: Pin<&mut Self>) {
-            let this = self.project();
-            this.alive_timer
-                .reset(tokio::time::Instant::now() + this.keep_alive.max_interval);
+        fn reset(self: Pin<&mut Self>, deadline: Instant) {
+            self.reset(tokio::time::Instant::from_std(deadline));
         }
 
-        fn poll_event(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Bytes> {
-            let this = self.as_mut().project();
-
-            ready!(this.alive_timer.poll(cx));
-
-            let event = this.keep_alive.event.clone();
-
-            self.reset();
-
-            Poll::Ready(event)
+        fn poll_timeout(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+            self.poll(cx)
         }
     }
 }
